@@ -22,7 +22,6 @@ function do_init() {
 	sudo sh -c "echo 0 > /proc/sys/kernel/randomize_va_space"
 
 	sudo umount $TARGET
-	sudo mkfs.ext4 -F /dev/$DEV || exit
 	sudo mount /dev/$DEV $TARGET || exit
 }
 
