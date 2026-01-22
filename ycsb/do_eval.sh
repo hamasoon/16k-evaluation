@@ -1,69 +1,147 @@
 #!/bin/bash
-DEV="nvme1n1"
-MNT_PATH="/mnt/nvme"
-DB_PATH="${MNT_PATH}/db"
-DB_SRC_PATH="/home/bae/rocksdb/"
-OUTDIR="/home/bae/16K_data/ycsb"
+set -euo pipefail
 
-YCSB_RUN_PROPERTIES="-p rocksdb.dir=${DB_PATH} \
-                -p threadcount=16 \
+source ./find_ssd.sh
+
+MOUNT_DIR="/mnt/nvme"
+DB_DIR="${MOUNT_DIR}"
+DB_SRC_DIR="/home/layfort/rocksdb"
+TARGET="${1:-}"
+
+get_cpus() {
+	local node
+	if [[ "$1" -eq 0 ]]; then
+		node=0
+	else
+		node=1
+	fi
+	local exclude_cpus='^(32|33|34|35|36|37|38|39|40)$'
+	lscpu -e=CPU,NODE | awk -v n="$node" '$2==n{print $1}' | grep -Ev "$exclude_cpus" | paste -sd,
+}
+
+
+YCSB_RUN_PROPERTIES="-p rocksdb.dir=${DB_DIR} \
                 -p rocksdb.optionsfile=rocksdb-options_run.ini \
                 -p maxexecutiontime=1800 \
                 -p status.interval=1"
 
-YCSB_LOAD_PROPERTIES="-p rocksdb.dir=${DB_PATH} \
+YCSB_LOAD_PROPERTIES="-p rocksdb.dir=${DB_DIR} \
                 -p rocksdb.optionsfile=rocksdb-options_load.ini"
 
-WORKLOADS_A2F=("workloada" "workloadb" "workloadc" "workloadf")
-WORKLOADS_DE=("workloadd" "workloade")
+WORKLOADS=(
+	"a"
+	"b"
+	"c"
+	"d"
+	"e"
+	"f"
+)
 
-function do_init() {
-    local workload=$1
-    local logdir=$OUTDIR/$workload/bm1743_full_load.log
+if [[ -z "$TARGET" || ! "$TARGET" =~ ^[0-3]$ ]]; then
+	echo "usage: $0 <TARGET: 0|1|2|3>" >&2
+	exit 1
+fi
 
-    sudo umount ${MNT_PATH}
-    sudo mkfs.ext4 -F /dev/${DEV}
-    sudo mount /dev/${DEV} ${MNT_PATH}
-    rm -rf "${DB_PATH}"
-    mkdir -p "${DB_PATH}"
-    sudo chown bae:bae ${DB_PATH}
-    rsync -av ${DB_SRC_PATH} ${DB_PATH}
+if [[ "$TARGET" -eq 0 ]]; then
+	SSD="${SSD}p1"
+else
+	SSD="/dev/nvme4n1"
+fi
 
-    mkdir -p $OUTDIR/$workload
+echo "Running evaluation with TARGET=${TARGET} on SSD=${SSD}"
 
-    sudo sh -c "echo 3 > /proc/sys/vm/drop_caches"
-    sudo sh -c "echo 0 > /proc/nvmev/buffer"
-    sudo sh -c "echo '' > $logdir"
+mkdir -p output
+sudo chown -R "$(whoami):$(whoami)" output
 
-    python2 ./bin/ycsb load rocksdb -s -P workloads/$workload ${YCSB_LOAD_PROPERTIES} 2>&1 | tee $logdir
+sudo umount "$MOUNT_DIR" || true
 
-    sudo cat /proc/nvmev/buffer >> $logdir
-}
+for w in "${WORKLOADS[@]}"; do
+	workload_path="workloads/workload${w}"
+	output_path="output/${w}"
+	mkdir -p "$output_path"
 
-function do_test() {
-    local workload=$1
-    local logdir=$OUTDIR/$workload/bm1743_full_test.log
+	if [[ ! -f "$workload_path" ]]; then
+ 		echo "missing workload file: $workload_path" >&2
+ 		exit 1
+	fi
 
-    mkdir -p $OUTDIR/$workload
+	if [[ $TARGET -ne 0 ]]; then
+		echo "Loading nvmev kernel module..."
+		if grep -q '^nvmev ' /proc/modules; then
+			sudo rmmod nvmev
+		fi
 
-    sudo sh -c "echo 3 > /proc/sys/vm/drop_caches"
-    sudo sh -c "echo 0 > /proc/nvmev/buffer"
-    sudo sh -c "echo '' > $logdir"
+		MAPPING=""
 
-    python2 ./bin/ycsb run rocksdb -s -P workloads/$workload ${YCSB_RUN_PROPERTIES} 2>&1 | tee $logdir
+		case "$TARGET" in
+			1) MAPPING="16k";;
+			2) MAPPING="4k";;
+			3) MAPPING="32k";;
+		esac
 
-    sudo cat /proc/nvmev/buffer >> $logdir
-}
+		sudo insmod ./nvmev_${MAPPING}.ko \
+		memmap_start=256G \
+		memmap_size=128G \
+		dispatcher_cpus=32,33,34,35 \
+		worker_cpus=36,37,38,39 \
+		intr_cpu=40
+	else
+		./format_ssd.sh
+	fi
+	
+    rm -rf "${DB_DIR}"
+    mkdir -p "${DB_DIR}"
 
-mkdir -p $OUTDIR
+	sudo mkfs.ext4 -F "$SSD"
+	sudo mount -o nobarrier "$SSD" "$MOUNT_DIR"
+    sudo chown "$(whoami):$(whoami)" ${DB_DIR}
+    rsync -av ${DB_SRC_DIR} ${DB_DIR}	
 
-do_init "workloada"
+    mkdir -p $output_path
 
-for wl in "${WORKLOADS_A2F[@]}"; do
-    do_test $wl
+	case "$TARGET" in
+ 		0) tag="BM1743" ;;
+ 		1) tag="virt-16k" ;;
+ 		2) tag="virt-4k" ;;
+ 		3) tag="virt-32k" ;;
+	esac
+
+	echo "laod ${w} in ${tag}"
+
+	sudo sh -c "echo 3 > /proc/sys/vm/drop_caches"
+
+	if [[ $TARGET -ne 0 ]]; then
+		sudo sh -c "echo 0 > /proc/nvmev/buffer"
+	fi
+
+	sudo numactl --physcpubind=$(get_cpus $TARGET) python2 ./bin/ycsb  load rocksdb -s -P $workload_path ${YCSB_LOAD_PROPERTIES} 2>&1 | tee ${output_path}/${tag}_load.log
+	
+	sudo chown "$(whoami):$(whoami)" "${output_path}/${tag}_load.log"
+
+	if [[ $TARGET -ne 0 ]]; then
+		sudo cat /proc/nvmev/buffer >> "${output_path}/${tag}_load.log"
+		sudo dmesg | tail -n 20 >> "${output_path}/${tag}_load.log"
+	fi
+
+	sudo sh -c "echo 3 > /proc/sys/vm/drop_caches"
+
+	if [[ $TARGET -ne 0 ]]; then
+		sudo sh -c "echo 0 > /proc/nvmev/buffer"
+	fi
+
+	sleep 600
+
+	sudo numactl --physcpubind=$(get_cpus $TARGET) python2 ./bin/ycsb run rocksdb -s -P $workload_path ${YCSB_RUN_PROPERTIES} 2>&1 | tee ${output_path}/${tag}_run.log
+
+	sudo chown "$(whoami):$(whoami)" "${output_path}/${tag}_run.log"
+
+	if [[ $TARGET -ne 0 ]]; then
+		sudo cat /proc/nvmev/buffer >> "${output_path}/${tag}_run.log"
+		sudo dmesg | tail -n 20 >> "${output_path}/${tag}_run.log"
+	fi
+	
+	sudo umount "$MOUNT_DIR" || true
+
+	sleep 600
 done
 
-for wl in "${WORKLOADS_DE[@]}"; do
-    do_init $wl
-    do_test $wl
-done
