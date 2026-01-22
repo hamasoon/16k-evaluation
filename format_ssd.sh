@@ -1,7 +1,6 @@
 #!/bin/bash
 
-ALIAS="/dev/disk/by-id/nvme-SAMSUNG_MZWMO61THCLF-00AW7_S7PBNE0X200455"
-SSD="$(realpath "${ALIAS}")"
+source ./find_ssd.sh
 echo $SSD
 
 sudo nvme format -f $SSD
